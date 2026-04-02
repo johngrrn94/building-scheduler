@@ -1,7 +1,7 @@
 import { useState, useRef, useCallback, useEffect, useMemo } from "react";
+
 import { createClient } from "@supabase/supabase-js";
 
-// Supabase client — reads from Vite env vars
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || "";
 const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY || "";
 const supabase = supabaseUrl && supabaseKey ? createClient(supabaseUrl, supabaseKey) : null;
@@ -51,7 +51,9 @@ const initialTasks = generateTasks();
 function toDateStr(d) { return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`; }
 function parseDate(s) { const [y,m,d] = s.split("-").map(Number); return new Date(y, m-1, d); }
 function addDays(d, n) { const r = new Date(d); r.setDate(r.getDate() + n); return r; }
-function isWeekday(d) { const dow = d.getDay(); return dow !== 0 && dow !== 6; }
+function isWeekday(d) { const dow = d.getDay(); if (_workWeekends.has(toDateStr(d))) return true; return dow !== 0 && dow !== 6; }
+const _workWeekends = new Set(); // module-level set synced from component state
+function isNaturalWeekend(d) { const dow = d.getDay(); return dow === 0 || dow === 6; }
 function addBizDays(d, n) { const r = new Date(d); let rem = n; while (rem > 0) { r.setDate(r.getDate() + 1); if (isWeekday(r)) rem--; } return r; }
 function idxIsWeekday(idx, anchor) { return isWeekday(addDays(anchor, idx)); }
 function diffDays(a, b) { return Math.round((b - a) / 86400000); }
@@ -148,16 +150,24 @@ export default function BuildingScheduler() {
   const [expandedCrewTask,setExpandedCrewTask]=useState(null);
   const [crewNameInput,setCrewNameInput]=useState("");
   const [showReport,setShowReport]=useState(false);
+  const [reportLog,setReportLog]=useState([]);
+  const [showReportLog,setShowReportLog]=useState(false);
+  const [viewingReport,setViewingReport]=useState(null);
   const [dailyTasks,setDailyTasks]=useState([{id:"daily-1",name:"Clean & Organize Tools/Materials",crew:2,crewMembers:[]}]);
   const [showDailyForm,setShowDailyForm]=useState(false);
   const [dailyFormData,setDailyFormData]=useState({name:"",crew:2});
   const [viewStart,setViewStart]=useState(()=>{const n=new Date();return new Date(n.getFullYear(),n.getMonth(),n.getDate())});
+  const [workWeekends,setWorkWeekends]=useState([]);
   const sidebarRef=useRef(null), sidebarScrollRef=useRef(null), chartScrollRef=useRef(null), chartHeaderRef=useRef(null), chartRef=useRef(null), exportRef=useRef(null);
   const dragStartX=useRef(0), dragOrigStart=useRef(null), dragOrigExt=useRef(null), dragEdge=useRef(null), dragLastDelta=useRef(0), dragMoved=useRef(false), isSyncing=useRef(false), isSyncingH=useRef(false);
   const dbReady=useRef(false);
   const saveTimer=useRef(null);
   const TOTAL_DAYS=180, ROW_H=34, DAY_W=30, CREW_H=72;
   const today=new Date();
+
+  // Sync workWeekends state to module-level Set so isWeekday() picks it up during render
+  useMemo(()=>{_workWeekends.clear();workWeekends.forEach(d=>_workWeekends.add(d));},[workWeekends]);
+  function toggleWorkWeekend(dateStr){setWorkWeekends(prev=>prev.includes(dateStr)?prev.filter(d=>d!==dateStr):[...prev,dateStr])}
 
   // --- DATABASE SYNC ---
   // Load from Supabase on mount
@@ -280,7 +290,7 @@ export default function BuildingScheduler() {
   }, []);
 
   const dailyCrewTotal=useMemo(()=>dailyTasks.reduce((s,t)=>s+t.crew,0),[dailyTasks]);
-  const eMap=useMemo(()=>autoMode?runAutoSchedule(taskOrder,taskMap,maxCrew-dailyCrewTotal,today>=viewStart?today:viewStart,phaseWindow):taskMap,[autoMode,taskMap,taskOrder,maxCrew,viewStart,phaseWindow,dailyCrewTotal]);
+  const eMap=useMemo(()=>autoMode?runAutoSchedule(taskOrder,taskMap,maxCrew-dailyCrewTotal,today>=viewStart?today:viewStart,phaseWindow):taskMap,[autoMode,taskMap,taskOrder,maxCrew,viewStart,phaseWindow,dailyCrewTotal,workWeekends]);
   const allTasks=useMemo(()=>taskOrder.map(id=>eMap[id]).filter(Boolean),[taskOrder,eMap]);
   const availPhases=useMemo(()=>[...new Set(allTasks.map(t=>getPhase(t.name)).filter(Boolean))].sort((a,b)=>a-b),[allTasks]);
   const tasks=useMemo(()=>phaseFilter===null?allTasks:allTasks.filter(t=>getPhase(t.name)===phaseFilter),[allTasks,phaseFilter]);
@@ -372,6 +382,36 @@ export default function BuildingScheduler() {
   function addCrewMember(taskId,name){if(!name.trim())return;setTaskMap(p=>({...p,[taskId]:{...p[taskId],crewMembers:[...(p[taskId].crewMembers||[]),name.trim()]}}));setCrewNameInput("")}
   function removeCrewMember(taskId,idx){setTaskMap(p=>({...p,[taskId]:{...p[taskId],crewMembers:(p[taskId].crewMembers||[]).filter((_,i)=>i!==idx)}}))}
 
+  function submitDayLog(dayIndex){
+    const day=days[dayIndex];if(!day||!isWeekday(day))return;
+    const dayLabel=`${DAYS_SHORT[day.getDay()]}, ${MONTHS_FULL[day.getMonth()]} ${day.getDate()}, ${day.getFullYear()}`;
+    const dayStr=toDateStr(day);
+    const activeTasks=allTasks.filter(t=>{if(t.blocked)return false;const s=parseDate(t.startDate),e=addBizDays(s,t.extDuration);return day>=s&&day<e});
+    // Check if a log already exists for this date
+    const existing=reportLog.find(r=>r.date===dayStr);
+    const snap={
+      id:existing?existing.id:`log-${Date.now()}`,
+      date:dayStr,
+      dateLabel:dayLabel,
+      timeLabel:new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}),
+      firstSubmitted:existing?existing.firstSubmitted||existing.timeLabel:new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}),
+      updates:(existing?.updates||0)+1,
+      tasks:activeTasks.map(t=>{const currPct=parseInt(t.status)||0;
+        // Use the original start-of-day pct from the first submission, not the current snapshot
+        const prevEntry=existing?.tasks?.find(et=>et.name===t.name);
+        const startPct=prevEntry?prevEntry.startPct:(todayStartPct.current[t.id]||0);
+        return{name:t.name,status:t.status||"Not Started",crew:t.crew,crewMembers:[...(t.crewMembers||[])],startPct,currPct,change:currPct-startPct}}),
+      dailyTasks:dailyTasks.map(dt=>({name:dt.name,crew:dt.crew,crewMembers:[...(dt.crewMembers||[])]})),
+      totalCrew:activeTasks.reduce((s,t)=>s+t.crew,0)+dailyCrewTotal
+    };
+    if(existing){
+      setReportLog(prev=>prev.map(r=>r.date===dayStr?snap:r));
+    }else{
+      setReportLog(prev=>[snap,...prev]);
+    }
+    setCrewDayIdx(null);setExpandedCrewTask(null);setCrewNameInput("");
+  }
+
   const utilPct=useMemo(()=>{const a=crewDay.filter(c=>c>0);if(!a.length)return 0;return Math.round((a.reduce((s,c)=>s+c,0)/a.length/maxCrew)*100)},[crewDay,maxCrew]);
   const span=useMemo(()=>{if(!allTasks.length)return 0;let mn=Infinity,mx=-Infinity;allTasks.forEach(t=>{const s=parseDate(t.startDate).getTime(),e=lastWorkDay(parseDate(t.startDate),t.extDuration).getTime();if(s<mn)mn=s;if(e>mx)mx=e});return Math.round((mx-mn)/86400000)},[allTasks]);
   async function exportPDF(){setExporting(true);try{await loadScript("https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js");await loadScript("https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js");const el=exportRef.current;if(!el)return;const canvas=await window.html2canvas(el,{scale:2,backgroundColor:"#0D1B2A",useCORS:true,logging:false,windowWidth:Math.max(el.scrollWidth,1400)});const{jsPDF}=window.jspdf;const pdf=new jsPDF({orientation:"landscape",unit:"pt",format:"letter"});const pW=pdf.internal.pageSize.getWidth(),pH=pdf.internal.pageSize.getHeight(),m=30,r=Math.min((pW-m*2)/canvas.width,(pH-m*2)/canvas.height);pdf.addImage(canvas.toDataURL("image/png"),"PNG",m+((pW-m*2)-canvas.width*r)/2,m,canvas.width*r,canvas.height*r);pdf.save(`schedule-${toDateStr(viewStart)}.pdf`)}catch(err){console.error(err)}finally{setExporting(false)}}
@@ -439,6 +479,7 @@ export default function BuildingScheduler() {
           {autoMode&&pinnedCount>0&&<button onClick={unpinAll} style={{padding:"3px 8px",fontSize:9,borderRadius:4,cursor:"pointer",fontFamily:"inherit",background:"#E8870E18",border:"1px solid #E8870E40",color:"#E8870E"}}>Unpin All</button>}
           <button onClick={exportPDF} disabled={exporting} style={{padding:"3px 8px",fontSize:9,borderRadius:4,cursor:"pointer",fontFamily:"inherit",background:"#132339",border:"1px solid #1A3550",color:"#A8C4DE"}}>PDF</button>
           <button onClick={()=>setShowReport(true)} style={{padding:"3px 8px",fontSize:9,fontWeight:600,borderRadius:4,cursor:"pointer",fontFamily:"inherit",background:"#132339",border:"1px solid #7AB64840",color:"#7AB648"}}>Report</button>
+          <button onClick={()=>setShowReportLog(true)} style={{padding:"3px 8px",fontSize:9,fontWeight:600,borderRadius:4,cursor:"pointer",fontFamily:"inherit",background:"#132339",border:"1px solid #0099D640",color:"#0099D6"}}>Log{reportLog.length>0?` (${reportLog.length})`:""}</button>
           <button onClick={openAddForm} style={{padding:"3px 8px",fontSize:9,fontWeight:600,borderRadius:4,border:"none",cursor:"pointer",fontFamily:"inherit",background:"#0099D6",color:"#fff"}}>+ Add</button>
         </div>
       </div>
@@ -470,7 +511,7 @@ export default function BuildingScheduler() {
           <div ref={chartHeaderRef} className="hide-scroll" style={{flex:1,overflowX:"auto"}} onScroll={onHeaderScroll}>
             <div ref={chartRef} style={{minWidth:TOTAL_DAYS*DAY_W}}>
               <div style={{display:"flex",height:22,borderBottom:"1px solid #1A3550"}}>{mGroups.map((mg,i)=><div key={mg.key} style={{width:`${(mg.count/TOTAL_DAYS)*100}%`,display:"flex",alignItems:"center",justifyContent:"center",borderRight:i<mGroups.length-1?"1px solid #1E3A5F":"none",background:"#0A1628"}}><span style={{fontSize:10,fontWeight:700,color:"#A8C4DE",fontFamily:"'Space Grotesk'"}}>{MONTHS_FULL[mg.month]} {mg.year}</span></div>)}</div>
-              <div style={{display:"flex",height:30,borderBottom:"1px solid #1A3550"}}>{days.map((d,i)=>{const isT=sameDay(d,today),isW=d.getDay()===0||d.getDay()===6,isF=d.getDate()===1;return <div key={i} style={{width:`${100/TOTAL_DAYS}%`,flexShrink:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",borderRight:isF?"1px solid #1E3A5F":"1px solid #152A42",background:isT?"#0099D610":isW?"#091828":"transparent"}}><span style={{fontSize:6,color:isT?"#0099D6":isW?"#1E3A5F":"#4A7090",textTransform:"uppercase",lineHeight:1}}>{DAYS_SHORT[d.getDay()]}</span><span style={{fontSize:8,fontWeight:isT?700:isF?600:500,color:isT?"#fff":isF?"#A8C4DE":isW?"#1E3A5F":"#7BA0C0",background:isT?"#0099D6":"transparent",borderRadius:5,width:isT?14:"auto",height:isT?12:"auto",display:"flex",alignItems:"center",justifyContent:"center",lineHeight:1,marginTop:1}}>{d.getDate()}</span></div>})}</div>
+              <div style={{display:"flex",height:30,borderBottom:"1px solid #1A3550"}}>{days.map((d,i)=>{const isT=sameDay(d,today),isW=!isWeekday(d),isWW=isNaturalWeekend(d)&&!isW,isF=d.getDate()===1;return <div key={i} style={{width:`${100/TOTAL_DAYS}%`,flexShrink:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",borderRight:isF?"1px solid #1E3A5F":"1px solid #152A42",background:isT?"#0099D610":isWW?"#F5A62308":isW?"#091828":"transparent"}}><span style={{fontSize:6,color:isT?"#0099D6":isWW?"#F5A623":isW?"#1E3A5F":"#4A7090",textTransform:"uppercase",lineHeight:1}}>{DAYS_SHORT[d.getDay()]}</span><span style={{fontSize:8,fontWeight:isT?700:isF?600:500,color:isT?"#fff":isWW?"#F5A623":isF?"#A8C4DE":isW?"#1E3A5F":"#7BA0C0",background:isT?"#0099D6":"transparent",borderRadius:5,width:isT?14:"auto",height:isT?12:"auto",display:"flex",alignItems:"center",justifyContent:"center",lineHeight:1,marginTop:1}}>{d.getDate()}</span></div>})}</div>
             </div>
           </div>
         </div>
@@ -496,14 +537,14 @@ export default function BuildingScheduler() {
           <div ref={chartScrollRef} onScroll={onChartScroll} style={{flex:1,overflowY:"auto",overflowX:"auto"}}>
             <div style={{minWidth:TOTAL_DAYS*DAY_W,position:"relative"}}>
               {dailyTasks.map((dt)=><div key={dt.id} style={{height:ROW_H,position:"relative",borderBottom:"1px solid #132339",background:"#F5A62304"}}>
-                {days.map((d,di)=>{const isW=d.getDay()===0||d.getDay()===6;return <div key={di} style={{position:"absolute",left:`${(di/TOTAL_DAYS)*100}%`,width:`${100/TOTAL_DAYS}%`,top:0,bottom:0,borderRight:"1px solid #152A42",background:isW?"#091422":"transparent"}}>{isWeekday(d)&&<div style={{position:"absolute",inset:0,background:"#F5A62318",borderTop:"1px solid #F5A62330",borderBottom:"1px solid #F5A62330"}}/>}</div>})}
+                {days.map((d,di)=>{const isW=!isWeekday(d);return <div key={di} style={{position:"absolute",left:`${(di/TOTAL_DAYS)*100}%`,width:`${100/TOTAL_DAYS}%`,top:0,bottom:0,borderRight:"1px solid #152A42",background:isW?"#091422":"transparent"}}>{isWeekday(d)&&<div style={{position:"absolute",inset:0,background:"#F5A62318",borderTop:"1px solid #F5A62330",borderBottom:"1px solid #F5A62330"}}/>}</div>})}
                 <span style={{fontSize:7,fontWeight:600,color:"#F5A62380",whiteSpace:"nowrap",paddingLeft:4,position:"absolute",top:8,left:4,zIndex:1}}>{dt.name} · {dt.crew}☻</span>
               </div>)}
               <div style={{height:24,borderBottom:"1px solid #1A3550"}}/>
               {visTasks.map((task,idx)=>{const bp=barPos(task);const color=getColor(idx);const isH=hoveredTask===task.id,isD=dragging===task.id,isDup=duplicatedId===task.id,viol=violations[task.id],sc=statusColor(task.status),isPinned=taskMap[task.id]?.pinned,isBlocked=taskMap[task.id]?.blocked;
                 return <div key={task.id} onMouseEnter={()=>!dragging&&!reorderDragId&&setHoveredTask(task.id)} onMouseLeave={()=>!dragging&&!reorderDragId&&setHoveredTask(null)}
                   className={isDup?"dup-flash":""} style={{height:ROW_H,position:"relative",borderBottom:"1px solid #132339",background:isH&&!isD?"#142840":"transparent"}}>
-                  {days.map((d,i)=>{const isW=d.getDay()===0||d.getDay()===6,isT=sameDay(d,today),isF=d.getDate()===1,isDC=isD&&dragHL.has(i);return <div key={i} style={{position:"absolute",left:`${(i/TOTAL_DAYS)*100}%`,width:`${100/TOTAL_DAYS}%`,top:0,bottom:0,borderRight:isF?"1px solid #1E3A5F":"1px solid #152A42",background:isDC?"#0099D60A":isT?"#0099D606":isW?"#091422":"transparent"}}/>})}
+                  {days.map((d,i)=>{const isW=!isWeekday(d),isT=sameDay(d,today),isF=d.getDate()===1,isDC=isD&&dragHL.has(i);return <div key={i} style={{position:"absolute",left:`${(i/TOTAL_DAYS)*100}%`,width:`${100/TOTAL_DAYS}%`,top:0,bottom:0,borderRight:isF?"1px solid #1E3A5F":"1px solid #152A42",background:isDC?"#0099D60A":isT?"#0099D606":isW?"#091422":"transparent"}}/>})}
                   {bp&&<div className={`gantt-bar ${isD?"is-dragging":""}`} style={{position:"absolute",top:3,height:ROW_H-6,left:`${(bp.startCol/TOTAL_DAYS)*100}%`,width:`${(bp.span/TOTAL_DAYS)*100}%`,background:isBlocked?`repeating-linear-gradient(135deg,#EF444415,#EF444415 4px,#EF444408 4px,#EF444408 8px)`:`linear-gradient(135deg, ${color}${isD?"C0":"90"}, ${color}${isD?"80":"50"})`,border:`1px solid ${isBlocked?"#EF444460":isPinned&&autoMode?"#E8870E":viol?"#F5A62390":`${color}${isD?"FF":"BB"}`}`,borderRadius:3,cursor:isBlocked?"pointer":isD?"grabbing":"pointer",zIndex:isD?50:3,display:"flex",alignItems:"center",padding:"0 3px",overflow:"hidden",opacity:isBlocked?.5:1,boxShadow:isD?`0 4px 16px ${color}60`:isH?`0 2px 10px ${color}40`:"none"}}
                     onMouseDown={e=>handleBarDown(e,task,"move")} onTouchStart={e=>handleBarDown(e,task,"move")}>
                     {task.status&&<div style={{position:"absolute",left:0,top:0,bottom:0,width:`${parseInt(task.status)}%`,background:`${sc}15`,borderRadius:"3px 0 0 3px",pointerEvents:"none"}}/>}
@@ -651,17 +692,28 @@ export default function BuildingScheduler() {
       {/* CREW DAY POPUP */}
       {crewDayIdx!==null&&days[crewDayIdx]&&(()=>{
         const day=days[crewDayIdx],dayStr=`${DAYS_SHORT[day.getDay()]}, ${MONTHS_FULL[day.getMonth()]} ${day.getDate()}, ${day.getFullYear()}`;
-        const activeTasks=isWeekday(day)?allTasks.filter(t=>{if(t.blocked)return false;const s=parseDate(t.startDate),e=addBizDays(s,t.extDuration);return day>=s&&day<e}):[];
-        const totalCrew=activeTasks.reduce((s,t)=>s+t.crew,0)+(isWeekday(day)?dailyCrewTotal:0);const isOver=totalCrew>maxCrew;const isWknd=!isWeekday(day);
+        const isNatWknd=isNaturalWeekend(day);const isWork=isWeekday(day);const dayDateStr=toDateStr(day);
+        const activeTasks=isWork?allTasks.filter(t=>{if(t.blocked)return false;const s=parseDate(t.startDate),e=addBizDays(s,t.extDuration);return day>=s&&day<e}):[];
+        const totalCrew=activeTasks.reduce((s,t)=>s+t.crew,0)+(isWork?dailyCrewTotal:0);const isOver=totalCrew>maxCrew;
         return <div style={{position:"fixed",inset:0,background:"#00000080",display:"flex",alignItems:"center",justifyContent:"center",zIndex:100,backdropFilter:"blur(4px)"}} onClick={()=>{setCrewDayIdx(null);setExpandedCrewTask(null);setCrewNameInput("")}}>
           <div className="fade-in" onClick={e=>e.stopPropagation()} style={{background:"#132339",border:"1px solid #1E3A5F",borderRadius:10,padding:18,width:420,maxWidth:"92vw",maxHeight:"80vh",overflowY:"auto"}}>
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
-              <div><h2 style={{fontFamily:"'Space Grotesk'",fontSize:14,fontWeight:700,color:"#FFFFFF"}}>{dayStr}</h2><p style={{fontSize:9,color:isWknd?"#5888A8":isOver?"#EF4444":"#5888A8",marginTop:2}}>{isWknd?"Weekend — no crew scheduled":totalCrew+" crew"+(isOver?` · ⚠ Over (max ${maxCrew})`:` of ${maxCrew}`)}</p></div>
+              <div>
+                <h2 style={{fontFamily:"'Space Grotesk'",fontSize:14,fontWeight:700,color:"#FFFFFF"}}>{dayStr}{isNatWknd&&isWork&&<span style={{fontSize:9,color:"#F5A623",marginLeft:6,fontWeight:600}}>WORK DAY</span>}</h2>
+                <p style={{fontSize:9,color:!isWork?"#5888A8":isOver?"#EF4444":"#5888A8",marginTop:2}}>{!isWork?"Weekend — no crew scheduled":totalCrew+" crew"+(isOver?` · ⚠ Over (max ${maxCrew})`:` of ${maxCrew}`)}</p>
+              </div>
               <button onClick={()=>{setCrewDayIdx(null);setExpandedCrewTask(null);setCrewNameInput("")}} style={{width:24,height:24,borderRadius:5,border:"1px solid #1E3A5F",background:"#132339",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",padding:0}}><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#5888A8" strokeWidth="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
             </div>
-            <div style={{marginBottom:12,background:"#0D1B2A",borderRadius:4,padding:6,border:"1px solid #1A3550"}}><div style={{display:"flex",justifyContent:"space-between",fontSize:8,color:"#5888A8",marginBottom:3}}><span>Crew</span><span style={{color:isOver?"#EF4444":"#A8C4DE",fontWeight:600}}>{totalCrew}/{maxCrew}</span></div><div style={{height:8,background:"#1A3550",borderRadius:4,overflow:"hidden"}}><div style={{height:"100%",width:`${Math.min(100,totalCrew/maxCrew*100)}%`,background:isOver?"#EF4444":"#0099D6",borderRadius:4}}/></div></div>
+            {/* Weekend toggle */}
+            {isNatWknd&&<div style={{marginBottom:12,padding:"8px 12px",background:isWork?"#F5A62310":"#0D1B2A",borderRadius:6,border:`1px solid ${isWork?"#F5A62330":"#1A3550"}`,display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+              <div><span style={{fontSize:11,fontWeight:600,color:isWork?"#F5A623":"#5888A8"}}>{isWork?"This weekend day is a work day":"This is a weekend — no work scheduled"}</span>
+                <p style={{fontSize:9,color:"#4A7090",marginTop:2}}>{isWork?"Auto-scheduler will assign tasks to this day":"Toggle to schedule crew on this day"}</p>
+              </div>
+              <button onClick={()=>toggleWorkWeekend(dayDateStr)} style={{padding:"5px 12px",fontSize:10,fontWeight:700,borderRadius:4,cursor:"pointer",fontFamily:"inherit",border:`1px solid ${isWork?"#EF444440":"#7AB64840"}`,background:isWork?"#EF444415":"#7AB64815",color:isWork?"#EF4444":"#7AB648"}}>{isWork?"Revert to Weekend":"Make Work Day"}</button>
+            </div>}
+            {isWork&&<div style={{marginBottom:12,background:"#0D1B2A",borderRadius:4,padding:6,border:"1px solid #1A3550"}}><div style={{display:"flex",justifyContent:"space-between",fontSize:8,color:"#5888A8",marginBottom:3}}><span>Crew</span><span style={{color:isOver?"#EF4444":"#A8C4DE",fontWeight:600}}>{totalCrew}/{maxCrew}</span></div><div style={{height:8,background:"#1A3550",borderRadius:4,overflow:"hidden"}}><div style={{height:"100%",width:`${Math.min(100,totalCrew/maxCrew*100)}%`,background:isOver?"#EF4444":"#0099D6",borderRadius:4}}/></div></div>}
             {/* Daily tasks in popup */}
-            {isWeekday(day)&&dailyTasks.length>0&&<div style={{marginBottom:6}}>
+            {isWork&&dailyTasks.length>0&&<div style={{marginBottom:6}}>
               <div style={{fontSize:7,fontWeight:600,color:"#7090A8",textTransform:"uppercase",padding:"0 4px 4px",letterSpacing:"0.05em"}}>Daily Recurring</div>
               {dailyTasks.map(dt=>{
                 const isExp=expandedCrewTask===dt.id;const members=dt.crewMembers||[];
@@ -687,7 +739,7 @@ export default function BuildingScheduler() {
                 </div>})}
             </div>}
             {/* Phase tasks */}
-            {activeTasks.length>0&&dailyTasks.length>0&&isWeekday(day)&&<div style={{fontSize:7,fontWeight:600,color:"#4A7090",textTransform:"uppercase",padding:"0 4px 4px",letterSpacing:"0.05em"}}>Phase Tasks</div>}
+            {activeTasks.length>0&&dailyTasks.length>0&&isWork&&<div style={{fontSize:7,fontWeight:600,color:"#4A7090",textTransform:"uppercase",padding:"0 4px 4px",letterSpacing:"0.05em"}}>Phase Tasks</div>}
             {activeTasks.length>0&&<div style={{display:"flex",flexDirection:"column",gap:2}}>
               {activeTasks.map((t)=>{const color=getColor(allTasks.indexOf(t));const sc=statusColor(t.status);const dayNum=(()=>{let cnt=0;const s=parseDate(t.startDate);for(let d=new Date(s);d<=day;d.setDate(d.getDate()+1)){if(isWeekday(d))cnt++}return cnt})();const isExp=expandedCrewTask===t.id;const members=t.crewMembers||[];
                 return <div key={t.id} style={{background:"#0D1B2A",borderRadius:5,border:`1px solid ${isExp?"#0099D640":"#1A3550"}`,overflow:"hidden"}}>
@@ -725,7 +777,8 @@ export default function BuildingScheduler() {
                   </div>}
                 </div>})}
             </div>}
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:10,padding:"8px 10px",background:isOver?"#EF444410":"#0099D610",borderRadius:5}}><span style={{fontSize:9,fontWeight:600,color:isOver?"#EF4444":"#33BBE6"}}>{activeTasks.length+(isWeekday(day)?dailyTasks.length:0)} tasks</span><span style={{fontSize:13,fontWeight:700,color:isOver?"#EF4444":"#33BBE6",fontFamily:"'Space Grotesk'"}}>{totalCrew}</span></div>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:10,padding:"8px 10px",background:isOver?"#EF444410":"#0099D610",borderRadius:5}}><span style={{fontSize:9,fontWeight:600,color:isOver?"#EF4444":"#33BBE6"}}>{activeTasks.length+(isWork?dailyTasks.length:0)} tasks</span><span style={{fontSize:13,fontWeight:700,color:isOver?"#EF4444":"#33BBE6",fontFamily:"'Space Grotesk'"}}>{totalCrew}</span></div>
+            {isWork&&<div style={{display:"flex",justifyContent:"flex-end",marginTop:8}}><button onClick={()=>submitDayLog(crewDayIdx)} style={{padding:"6px 16px",fontSize:11,fontWeight:700,borderRadius:5,border:"none",cursor:"pointer",fontFamily:"inherit",background:"#7AB648",color:"#fff"}}>✓ Submit Day Log</button></div>}
           </div>
         </div>
       })()}
@@ -773,7 +826,7 @@ export default function BuildingScheduler() {
                       {isB&&t.blockedReason&&<div style={{fontSize:11,color:"#EF444460",marginTop:2}}>↳ {t.blockedReason}</div>}
                       {(t.missedCount||0)>0&&!isB&&!isDone&&<div style={{fontSize:11,color:"#EF444470",marginTop:2}}>↳ {t.missedCount} day{t.missedCount>1?"s":""} delayed from missed updates</div>}
                     </div>
-                    <span style={{fontSize:13,fontWeight:isB||isDone||isS?600:400,color:tsc,minWidth:90,textAlign:"right",flexShrink:0}}>{isB?"Blocked":isDone?"Finished":isS?t.status+" complete":"Not Started"}{(t.missedCount||0)>0&&!isB&&!isDone?` (+${t.missedCount})`:""}</span>
+                    <span style={{fontSize:13,fontWeight:isB||isDone||isS?600:400,color:tsc,minWidth:90,textAlign:"right",flexShrink:0}}>{isB?(pct>0?`Blocked · ${pct}% complete`:"Blocked"):isDone?"Finished":isS?t.status+" complete":"Not Started"}{(t.missedCount||0)>0&&!isB&&!isDone?` (+${t.missedCount})`:""}</span>
                   </div>})}</div>
               </div>})}
 
@@ -864,6 +917,92 @@ export default function BuildingScheduler() {
           </div>
         </div>
       })()}
+
+      {/* REPORT LOG */}
+      {showReportLog&&<div style={{position:"fixed",inset:0,background:"#00000080",display:"flex",alignItems:"center",justifyContent:"center",zIndex:100,backdropFilter:"blur(4px)"}} onClick={()=>{setShowReportLog(false);setViewingReport(null)}}>
+        <div className="fade-in" onClick={e=>e.stopPropagation()} style={{background:"#132339",border:"1px solid #1E3A5F",borderRadius:12,padding:24,width:580,maxWidth:"94vw",maxHeight:"88vh",overflowY:"auto"}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+            <div>
+              <h2 style={{fontFamily:"'Space Grotesk'",fontSize:20,fontWeight:700,color:"#FFFFFF"}}>Day Logs</h2>
+              <p style={{fontSize:12,color:"#5888A8",marginTop:3}}>{reportLog.length} log{reportLog.length!==1?"s":""} submitted</p>
+            </div>
+            <button onClick={()=>{setShowReportLog(false);setViewingReport(null)}} style={{width:28,height:28,borderRadius:6,border:"1px solid #1E3A5F",background:"#132339",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",padding:0}}><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#5888A8" strokeWidth="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+          </div>
+          {viewingReport?(()=>{
+            const rpt=viewingReport;
+            return <div>
+              <button onClick={()=>setViewingReport(null)} style={{padding:"4px 10px",fontSize:11,borderRadius:4,border:"1px solid #1E3A5F",cursor:"pointer",fontFamily:"inherit",background:"transparent",color:"#33BBE6",marginBottom:12}}>← Back to log</button>
+              <div style={{padding:"12px 14px",background:"#0D1B2A",borderRadius:6,border:"1px solid #1A3550",marginBottom:12}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                  <span style={{fontSize:15,fontWeight:700,color:"#FFFFFF",fontFamily:"'Space Grotesk'"}}>{rpt.dateLabel}</span>
+                  <span style={{fontSize:12,color:"#5888A8"}}>Last update {rpt.timeLabel}{rpt.updates>1?` · ${rpt.updates} updates since ${rpt.firstSubmitted}`:""} · {rpt.totalCrew} crew</span>
+                </div>
+              </div>
+              {/* Daily recurring tasks */}
+              {rpt.dailyTasks?.length>0&&<div style={{marginBottom:10}}>
+                <div style={{fontSize:11,fontWeight:600,color:"#F5A623",textTransform:"uppercase",letterSpacing:"0.05em",padding:"0 4px 6px"}}>Daily Tasks</div>
+                {rpt.dailyTasks.map((dt,i)=><div key={i} style={{display:"flex",alignItems:"center",gap:8,padding:"8px 12px",background:"#0D1B2A",borderRadius:5,border:"1px solid #1A3550",marginBottom:3}}>
+                  <div style={{width:8,height:8,borderRadius:"50%",background:"#F5A623",flexShrink:0}}/>
+                  <span style={{fontSize:13,color:"#F5A623",flex:1,fontWeight:600}}>{dt.name}</span>
+                  <span style={{fontSize:12,color:"#5888A8"}}>{dt.crew} crew</span>
+                  {dt.crewMembers?.length>0&&<div style={{display:"flex",gap:3,flexWrap:"wrap"}}>{dt.crewMembers.map((n,j)=><span key={j} style={{fontSize:10,color:"#E0ECF6",background:"#F5A62318",border:"1px solid #F5A62330",borderRadius:3,padding:"1px 6px"}}>{n}</span>)}</div>}
+                </div>)}
+              </div>}
+              {/* Phase tasks */}
+              {rpt.tasks?.length>0&&<div>
+                <div style={{fontSize:11,fontWeight:600,color:"#33BBE6",textTransform:"uppercase",letterSpacing:"0.05em",padding:"0 4px 6px"}}>Phase Tasks</div>
+                {rpt.tasks.map((t,i)=>{const pct=t.currPct||parseInt(t.status)||0;const sc=pct>=80?"#7AB648":pct>=40?"#F5A623":pct>0?"#0099D6":"#5888A8";const change=t.change||0;const startPct=t.startPct||0;
+                  return <div key={i} style={{padding:"10px 12px",background:"#0D1B2A",borderRadius:5,border:`1px solid ${change>0?"#7AB64830":change===0&&pct>0?"#F5A62320":"#1A3550"}`,marginBottom:4}}>
+                    <div style={{display:"flex",alignItems:"center",gap:8}}>
+                      <span style={{fontSize:13,color:"#E0ECF6",flex:1,fontWeight:600}}>{t.name}</span>
+                      <span style={{fontSize:13,fontWeight:700,color:sc}}>{t.status||"Not Started"}</span>
+                    </div>
+                    {/* Progress bar with start-of-day vs end-of-day */}
+                    <div style={{display:"flex",alignItems:"center",gap:8,marginTop:5}}>
+                      <div style={{flex:1,height:8,background:"#1A3550",borderRadius:4,overflow:"hidden",position:"relative"}}>
+                        {startPct>0&&<div style={{position:"absolute",left:0,top:0,bottom:0,width:`${startPct}%`,background:sc,borderRadius:4,opacity:.35}}/>}
+                        {change>0&&<div style={{position:"absolute",left:`${startPct}%`,top:0,bottom:0,width:`${change}%`,background:sc,borderRadius:startPct===0?"4px 0 0 4px":"0"}}/>}
+                        {pct>0&&change===0&&<div style={{position:"absolute",left:0,top:0,bottom:0,width:`${pct}%`,background:sc,borderRadius:4,opacity:.35}}/>}
+                      </div>
+                      <span style={{fontSize:10,color:"#5888A8",flexShrink:0}}>{t.crew} crew</span>
+                    </div>
+                    {/* Change indicator */}
+                    <div style={{display:"flex",alignItems:"center",gap:8,marginTop:5}}>
+                      {change>0?<span style={{fontSize:12,fontWeight:700,color:"#7AB648"}}>+{change}% today</span>
+                        :pct>0?<span style={{fontSize:12,fontWeight:600,color:"#F5A623"}}>No change</span>
+                        :<span style={{fontSize:12,color:"#5888A8"}}>Not started</span>}
+                      {startPct>0&&<span style={{fontSize:10,color:"#4A7090"}}>Started day at {startPct}%</span>}
+                    </div>
+                    {/* Crew members */}
+                    {t.crewMembers?.length>0&&<div style={{display:"flex",gap:3,flexWrap:"wrap",marginTop:5}}>{t.crewMembers.map((n,j)=><span key={j} style={{fontSize:10,color:"#E0ECF6",background:"#0099D618",border:"1px solid #0099D630",borderRadius:3,padding:"1px 6px"}}>{n}</span>)}</div>}
+                    {(!t.crewMembers||t.crewMembers.length===0)&&<div style={{fontSize:10,color:"#4A7090",marginTop:4}}>No crew assigned</div>}
+                  </div>})}
+              </div>}
+              {rpt.tasks?.length===0&&rpt.dailyTasks?.length===0&&<div style={{padding:20,textAlign:"center",color:"#4A7090",fontSize:13}}>No tasks logged</div>}
+            </div>
+          })():(
+            reportLog.length===0?<div style={{padding:40,textAlign:"center"}}><div style={{fontSize:14,color:"#4A7090",marginBottom:8}}>No day logs submitted yet</div><p style={{fontSize:12,color:"#5888A8"}}>Open a day's crew popup and click "Submit Day Log" to record it here.</p></div>
+            :<div style={{display:"flex",flexDirection:"column",gap:4}}>
+              {reportLog.map((rpt)=>{
+                const changed=(rpt.tasks||[]).filter(t=>(t.change||0)>0).length;
+                const noChange=(rpt.tasks||[]).filter(t=>(t.change||0)===0&&(t.currPct||parseInt(t.status)||0)>0).length;
+                return <div key={rpt.id} onClick={()=>setViewingReport(rpt)} style={{display:"flex",alignItems:"center",gap:12,padding:"12px 14px",background:"#0D1B2A",borderRadius:6,border:"1px solid #1A3550",cursor:"pointer",transition:"border-color .15s"}}
+                  onMouseEnter={e=>e.currentTarget.style.borderColor="#0099D650"} onMouseLeave={e=>e.currentTarget.style.borderColor="#1A3550"}>
+                  <div style={{width:40,height:40,borderRadius:8,background:"#0099D615",border:"1px solid #0099D630",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
+                    <span style={{fontSize:14,fontWeight:700,color:"#33BBE6",fontFamily:"'Space Grotesk'"}}>{rpt.totalCrew}</span>
+                  </div>
+                  <div style={{flex:1}}>
+                    <div style={{fontSize:13,fontWeight:600,color:"#E0ECF6"}}>{rpt.dateLabel}</div>
+                    <div style={{fontSize:11,color:"#5888A8"}}>Last update {rpt.timeLabel}{rpt.updates>1?` · First at ${rpt.firstSubmitted} · ${rpt.updates} updates`:""} · {rpt.totalCrew} crew</div>
+                    <div style={{fontSize:10,marginTop:2}}>{changed>0&&<span style={{color:"#7AB648",fontWeight:600}}>{changed} progressed</span>}{changed>0&&noChange>0&&<span style={{color:"#4A7090"}}> · </span>}{noChange>0&&<span style={{color:"#F5A623"}}>{noChange} no change</span>}</div>
+                  </div>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#4A7090" strokeWidth="2"><polyline points="9 18 15 12 9 6"/></svg>
+                </div>
+              })}
+            </div>
+          )}
+        </div>
+      </div>}
 
       {/* ADD DAILY TASK */}
       {showDailyForm&&<div style={{position:"fixed",inset:0,background:"#00000080",display:"flex",alignItems:"center",justifyContent:"center",zIndex:100,backdropFilter:"blur(4px)"}} onClick={()=>setShowDailyForm(false)}>
