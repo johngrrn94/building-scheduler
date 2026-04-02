@@ -307,7 +307,7 @@ export default function BuildingScheduler() {
     while (rem > 0) { r.setDate(r.getDate() + 1); if (isWeekday(r)) rem--; }
     return r;
   }
-  function endDate(t){return toDateStr(lastWorkDay(parseDate(t.startDate),t.extDuration))}
+  function endDate(t){const dur=t.blocked?(t.fullDuration||t.extDuration):t.extDuration;return toDateStr(lastWorkDay(parseDate(t.startDate),dur))}
   const days=useMemo(()=>{const a=[];for(let i=0;i<TOTAL_DAYS;i++)a.push(addDays(viewStart,i));return a},[viewStart]);
   const mGroups=useMemo(()=>{const g=[];let c=null;days.forEach(d=>{const k=`${d.getFullYear()}-${d.getMonth()}`;if(!c||c.key!==k){c={key:k,month:d.getMonth(),year:d.getFullYear(),count:0};g.push(c)}c.count++});return g},[days]);
   const crewDay=useMemo(()=>days.map(day=>{if(!isWeekday(day))return 0;let t=dailyCrewTotal;allTasks.forEach(tk=>{if(tk.blocked)return;const s=parseDate(tk.startDate),e=addBizDays(s,tk.extDuration);if(day>=s&&day<e&&isWeekday(day))t+=tk.crew});return t}),[days,allTasks,dailyCrewTotal]);
@@ -315,7 +315,7 @@ export default function BuildingScheduler() {
   const dragTask=dragging!==null?allTasks.find(t=>t.id===dragging):null;
   const visTasks=useMemo(()=>{if(!reorderDragId||reorderOverIdx===null)return tasks;const a=[...tasks];const fi=a.findIndex(t=>t.id===reorderDragId);if(fi===-1||fi===reorderOverIdx)return a;const[item]=a.splice(fi,1);a.splice(reorderOverIdx,0,item);return a},[tasks,reorderDragId,reorderOverIdx]);
 
-  function barPos(t){const s=parseDate(t.startDate),last=lastWorkDay(s,t.extDuration),visualEnd=addDays(last,1),clS=Math.max(0,diffDays(viewStart,s)),clE=Math.min(TOTAL_DAYS,diffDays(viewStart,visualEnd));return clE<=clS?null:{startCol:clS,span:clE-clS}}
+  function barPos(t){const dur=t.blocked?(t.fullDuration||t.extDuration):t.extDuration;const s=parseDate(t.startDate),last=lastWorkDay(s,dur),visualEnd=addDays(last,1),clS=Math.max(0,diffDays(viewStart,s)),clE=Math.min(TOTAL_DAYS,diffDays(viewStart,visualEnd));return clE<=clS?null:{startCol:clS,span:clE-clS}}
   function cPos(e){if(e.touches?.length)return{x:e.touches[0].clientX,y:e.touches[0].clientY};if(e.changedTouches?.length)return{x:e.changedTouches[0].clientX,y:e.changedTouches[0].clientY};return{x:e.clientX,y:e.clientY}}
 
   function onSideScroll(e){if(isSyncing.current)return;isSyncing.current=true;if(chartScrollRef.current)chartScrollRef.current.scrollTop=e.target.scrollTop;isSyncing.current=false}
@@ -413,7 +413,7 @@ export default function BuildingScheduler() {
   }
 
   const utilPct=useMemo(()=>{const a=crewDay.filter(c=>c>0);if(!a.length)return 0;return Math.round((a.reduce((s,c)=>s+c,0)/a.length/maxCrew)*100)},[crewDay,maxCrew]);
-  const span=useMemo(()=>{if(!allTasks.length)return 0;let mn=Infinity,mx=-Infinity;allTasks.forEach(t=>{const s=parseDate(t.startDate).getTime(),e=lastWorkDay(parseDate(t.startDate),t.extDuration).getTime();if(s<mn)mn=s;if(e>mx)mx=e});return Math.round((mx-mn)/86400000)},[allTasks]);
+  const span=useMemo(()=>{if(!allTasks.length)return 0;let mn=Infinity,mx=-Infinity;allTasks.forEach(t=>{const dur=t.blocked?(t.fullDuration||t.extDuration):t.extDuration;const s=parseDate(t.startDate).getTime(),e=lastWorkDay(parseDate(t.startDate),dur).getTime();if(s<mn)mn=s;if(e>mx)mx=e});return Math.round((mx-mn)/86400000)},[allTasks]);
   async function exportPDF(){setExporting(true);try{await loadScript("https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js");await loadScript("https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js");const el=exportRef.current;if(!el)return;const canvas=await window.html2canvas(el,{scale:2,backgroundColor:"#0D1B2A",useCORS:true,logging:false,windowWidth:Math.max(el.scrollWidth,1400)});const{jsPDF}=window.jspdf;const pdf=new jsPDF({orientation:"landscape",unit:"pt",format:"letter"});const pW=pdf.internal.pageSize.getWidth(),pH=pdf.internal.pageSize.getHeight(),m=30,r=Math.min((pW-m*2)/canvas.width,(pH-m*2)/canvas.height);pdf.addImage(canvas.toDataURL("image/png"),"PNG",m+((pW-m*2)-canvas.width*r)/2,m,canvas.width*r,canvas.height*r);pdf.save(`schedule-${toDateStr(viewStart)}.pdf`)}catch(err){console.error(err)}finally{setExporting(false)}}
 
   const cats=[...new Set(Object.values(taskMap).map(t=>t.category).filter(Boolean))];
