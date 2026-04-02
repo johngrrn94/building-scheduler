@@ -165,7 +165,8 @@ export default function BuildingScheduler() {
     if(!supabase)return;
     async function loadDB(){
       try{
-        const{data:rows}=await supabase.from("tasks").select("*").order("sort_order");
+        const{data:rows,error}=await supabase.from("tasks").select("*").order("sort_order");
+        if(error){console.error("DB load error:",error);return;} // DON'T set dbReady on failure
         if(rows&&rows.length>0){
           const m={};const order=[];let maxId=0;
           rows.forEach(r=>{
@@ -186,8 +187,8 @@ export default function BuildingScheduler() {
         if(dtRows&&dtRows.length>0){
           setDailyTasks(dtRows.map(r=>({id:r.id,name:r.name,crew:r.crew,crewMembers:r.crew_members||[]})));
         }
-      }catch(err){console.error("DB load error:",err);}
-      dbReady.current=true;
+        dbReady.current=true; // ONLY set ready after successful load
+      }catch(err){console.error("DB load error:",err);} // dbReady stays false on failure
     }
     async function seedDB(){
       const rows=taskOrder.map((id,i)=>{const t=taskMap[id];if(!t)return null;return{
@@ -198,17 +199,22 @@ export default function BuildingScheduler() {
     loadDB();
   },[]);
 
-  // Save tasks to Supabase when they change (debounced)
+  // Save tasks to Supabase when they change (debounced) — uses upsert, never deletes first
   useEffect(()=>{
     if(!supabase||!dbReady.current)return;
     if(saveTimer.current)clearTimeout(saveTimer.current);
     saveTimer.current=setTimeout(async()=>{
       try{
-        await supabase.from("tasks").delete().gte("id",0);
+        // Build current rows
         const rows=taskOrder.map((id,i)=>{const t=taskMap[id];if(!t)return null;return{
           id:t.id,name:t.name,start_date:t.startDate,int_duration:t.intDuration,ext_duration:t.extDuration,base_crew:t.baseCrew,base_dur:t.baseDur,category:t.category,crew:t.crew,deps:t.deps||[],status:t.status,full_duration:t.fullDuration||t.extDuration,full_int_duration:t.fullIntDuration||t.intDuration,crew_members:t.crewMembers||[],pinned:t.pinned||false,blocked:t.blocked||false,blocked_reason:t.blockedReason||"",last_update_date:t.lastUpdateDate||"",missed_count:t.missedCount||0,sort_order:i
         };}).filter(Boolean);
-        if(rows.length)await supabase.from("tasks").insert(rows);
+        // Upsert current tasks (safe — won't lose data if insert fails)
+        if(rows.length)await supabase.from("tasks").upsert(rows);
+        // Remove tasks that no longer exist
+        const currentIds=rows.map(r=>r.id);
+        const{data:dbRows}=await supabase.from("tasks").select("id");
+        if(dbRows){const staleIds=dbRows.filter(r=>!currentIds.includes(r.id)).map(r=>r.id);if(staleIds.length)await supabase.from("tasks").delete().in("id",staleIds);}
       }catch(err){console.error("DB save error:",err);}
     },800);
     return()=>{if(saveTimer.current)clearTimeout(saveTimer.current);};
@@ -228,9 +234,14 @@ export default function BuildingScheduler() {
   useEffect(()=>{
     if(!supabase||!dbReady.current)return;
     (async()=>{
-      await supabase.from("daily_tasks").delete().neq("id","");
-      const rows=dailyTasks.map(dt=>({id:dt.id,name:dt.name,crew:dt.crew,crew_members:dt.crewMembers||[]}));
-      if(rows.length)await supabase.from("daily_tasks").insert(rows);
+      try{
+        const rows=dailyTasks.map(dt=>({id:dt.id,name:dt.name,crew:dt.crew,crew_members:dt.crewMembers||[]}));
+        if(rows.length)await supabase.from("daily_tasks").upsert(rows);
+        // Remove deleted daily tasks
+        const currentIds=rows.map(r=>r.id);
+        const{data:dbRows}=await supabase.from("daily_tasks").select("id");
+        if(dbRows){const staleIds=dbRows.filter(r=>!currentIds.includes(r.id)).map(r=>r.id);if(staleIds.length)await supabase.from("daily_tasks").delete().in("id",staleIds);}
+      }catch(err){console.error("DB daily save error:",err);}
     })();
   },[dailyTasks]);
 
