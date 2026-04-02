@@ -308,6 +308,34 @@ export default function BuildingScheduler() {
     return r;
   }
   function endDate(t){const dur=t.blocked?(t.fullDuration||t.extDuration):t.extDuration;return toDateStr(lastWorkDay(parseDate(t.startDate),dur))}
+
+  // Baseline finish: original task data, no delays, no blocks — the original target
+  const baselineFinish=useMemo(()=>{
+    const baseMap={};
+    for(const id of Object.keys(taskMap)){const t=taskMap[id];baseMap[id]={...t,blocked:false,extDuration:t.fullDuration||t.extDuration,missedCount:0};}
+    const projected=runAutoSchedule(taskOrder,baseMap,maxCrew-dailyCrewTotal,today>=viewStart?today:viewStart,phaseWindow);
+    let maxEnd=null;
+    for(const id of taskOrder){const t=projected[id];if(!t)continue;const end=lastWorkDay(parseDate(t.startDate),t.extDuration);if(!maxEnd||end>maxEnd)maxEnd=end;}
+    return maxEnd;
+  },[taskOrder,maxCrew,viewStart,phaseWindow,dailyCrewTotal,workWeekends]);
+
+  // Current projected finish: uses actual durations (with delays), unblocks all tasks
+  const projectedFinish=useMemo(()=>{
+    const unblockedMap={};
+    for(const id of Object.keys(taskMap)){unblockedMap[id]={...taskMap[id],blocked:false};}
+    const projected=runAutoSchedule(taskOrder,unblockedMap,maxCrew-dailyCrewTotal,today>=viewStart?today:viewStart,phaseWindow);
+    let maxEnd=null;
+    for(const id of taskOrder){const t=projected[id];if(!t)continue;const end=lastWorkDay(parseDate(t.startDate),t.extDuration);if(!maxEnd||end>maxEnd)maxEnd=end;}
+    return maxEnd;
+  },[taskMap,taskOrder,maxCrew,viewStart,phaseWindow,dailyCrewTotal,workWeekends]);
+
+  // How many days ahead or behind schedule
+  const finishDelta=useMemo(()=>{
+    if(!projectedFinish||!baselineFinish)return 0;
+    return Math.round((projectedFinish-baselineFinish)/86400000);
+  },[projectedFinish,baselineFinish]);
+  const finishColor=finishDelta<=0?"#7AB648":finishDelta<=7?"#F5A623":"#EF4444";
+  const finishLabel=finishDelta<=0?"On Schedule":"Behind Schedule";
   const days=useMemo(()=>{const a=[];for(let i=0;i<TOTAL_DAYS;i++)a.push(addDays(viewStart,i));return a},[viewStart]);
   const mGroups=useMemo(()=>{const g=[];let c=null;days.forEach(d=>{const k=`${d.getFullYear()}-${d.getMonth()}`;if(!c||c.key!==k){c={key:k,month:d.getMonth(),year:d.getFullYear(),count:0};g.push(c)}c.count++});return g},[days]);
   const crewDay=useMemo(()=>days.map(day=>{if(!isWeekday(day))return 0;let t=dailyCrewTotal;allTasks.forEach(tk=>{if(tk.blocked)return;const s=parseDate(tk.startDate),e=addBizDays(s,tk.extDuration);if(day>=s&&day<e&&isWeekday(day))t+=tk.crew});return t}),[days,allTasks,dailyCrewTotal]);
@@ -471,7 +499,7 @@ export default function BuildingScheduler() {
       <div style={{padding:"12px 20px 8px",borderBottom:"1px solid #1A3550",display:"flex",justifyContent:"space-between",alignItems:"flex-start",flexWrap:"wrap",gap:8}}>
         <div>
           <div style={{display:"flex",alignItems:"center",gap:8}}><div style={{width:6,height:6,background:"#0099D6",borderRadius:2}}/><h1 style={{fontFamily:"'Space Grotesk'",fontSize:17,fontWeight:700,color:"#FFFFFF"}}>Building Schedule</h1></div>
-          <p style={{fontSize:9,color:"#5888A8",marginTop:2,paddingLeft:14}}>{allTasks.length} tasks · {span}d span · {utilPct}% util{pinnedCount>0&&autoMode&&<span style={{color:"#E8870E"}}> · {pinnedCount} pinned</span>}{blockedCount>0&&<span style={{color:"#EF4444"}}> · {blockedCount} blocked</span>}{dailyCrewTotal>0&&<span style={{color:"#F5A623"}}> · {dailyCrewTotal} daily crew</span>}{vCount>0&&!autoMode&&<span style={{color:"#F5A623",marginLeft:6}}>⚠ {vCount} violations</span>}</p>
+          <p style={{fontSize:9,color:"#5888A8",marginTop:2,paddingLeft:14}}>{allTasks.length} tasks · {span}d span · {utilPct}% util{pinnedCount>0&&autoMode&&<span style={{color:"#E8870E"}}> · {pinnedCount} pinned</span>}{blockedCount>0&&<span style={{color:"#EF4444"}}> · {blockedCount} blocked</span>}{dailyCrewTotal>0&&<span style={{color:"#F5A623"}}> · {dailyCrewTotal} daily crew</span>}{vCount>0&&!autoMode&&<span style={{color:"#F5A623",marginLeft:6}}>⚠ {vCount} violations</span>}{projectedFinish&&<span style={{color:finishColor}}> · Finish: {MONTHS_FULL[projectedFinish.getMonth()].slice(0,3)} {projectedFinish.getDate()}</span>}</p>
         </div>
         <div style={{display:"flex",gap:5,alignItems:"center",flexWrap:"wrap"}}>
           <button onClick={()=>setShowSettings(true)} style={{padding:"3px 8px",fontSize:9,borderRadius:4,cursor:"pointer",fontFamily:"inherit",background:hasOver?"#EF444418":"#132339",border:`1px solid ${hasOver?"#EF444450":"#1A3550"}`,color:hasOver?"#EF4444":"#A8C4DE"}}>Crew:{maxCrew} · Win:{phaseWindow}</button>
@@ -511,7 +539,7 @@ export default function BuildingScheduler() {
           <div ref={chartHeaderRef} className="hide-scroll" style={{flex:1,overflowX:"auto"}} onScroll={onHeaderScroll}>
             <div ref={chartRef} style={{minWidth:TOTAL_DAYS*DAY_W}}>
               <div style={{display:"flex",height:22,borderBottom:"1px solid #1A3550"}}>{mGroups.map((mg,i)=><div key={mg.key} style={{width:`${(mg.count/TOTAL_DAYS)*100}%`,display:"flex",alignItems:"center",justifyContent:"center",borderRight:i<mGroups.length-1?"1px solid #1E3A5F":"none",background:"#0A1628"}}><span style={{fontSize:10,fontWeight:700,color:"#A8C4DE",fontFamily:"'Space Grotesk'"}}>{MONTHS_FULL[mg.month]} {mg.year}</span></div>)}</div>
-              <div style={{display:"flex",height:30,borderBottom:"1px solid #1A3550"}}>{days.map((d,i)=>{const isT=sameDay(d,today),isW=!isWeekday(d),isWW=isNaturalWeekend(d)&&!isW,isF=d.getDate()===1;return <div key={i} style={{width:`${100/TOTAL_DAYS}%`,flexShrink:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",borderRight:isF?"1px solid #1E3A5F":"1px solid #152A42",background:isT?"#0099D610":isWW?"#F5A62308":isW?"#091828":"transparent"}}><span style={{fontSize:6,color:isT?"#0099D6":isWW?"#F5A623":isW?"#1E3A5F":"#4A7090",textTransform:"uppercase",lineHeight:1}}>{DAYS_SHORT[d.getDay()]}</span><span style={{fontSize:8,fontWeight:isT?700:isF?600:500,color:isT?"#fff":isWW?"#F5A623":isF?"#A8C4DE":isW?"#1E3A5F":"#7BA0C0",background:isT?"#0099D6":"transparent",borderRadius:5,width:isT?14:"auto",height:isT?12:"auto",display:"flex",alignItems:"center",justifyContent:"center",lineHeight:1,marginTop:1}}>{d.getDate()}</span></div>})}</div>
+              <div style={{display:"flex",height:30,borderBottom:"1px solid #1A3550"}}>{days.map((d,i)=>{const isT=sameDay(d,today),isW=!isWeekday(d),isWW=isNaturalWeekend(d)&&!isW,isF=d.getDate()===1,isPF=projectedFinish&&sameDay(d,projectedFinish);return <div key={i} style={{width:`${100/TOTAL_DAYS}%`,flexShrink:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",borderRight:isF?"1px solid #1E3A5F":"1px solid #152A42",background:isPF?`${finishColor}20`:isT?"#0099D610":isWW?"#F5A62308":isW?"#091828":"transparent"}}><span style={{fontSize:6,color:isPF?finishColor:isT?"#0099D6":isWW?"#F5A623":isW?"#1E3A5F":"#4A7090",textTransform:"uppercase",lineHeight:1}}>{DAYS_SHORT[d.getDay()]}</span><span style={{fontSize:8,fontWeight:isPF||isT?700:isF?600:500,color:isPF?"#000":isT?"#fff":isWW?"#F5A623":isF?"#A8C4DE":isW?"#1E3A5F":"#7BA0C0",background:isPF?finishColor:isT?"#0099D6":"transparent",borderRadius:5,width:isPF||isT?14:"auto",height:isPF||isT?12:"auto",display:"flex",alignItems:"center",justifyContent:"center",lineHeight:1,marginTop:1}}>{d.getDate()}</span></div>})}</div>
             </div>
           </div>
         </div>
@@ -560,6 +588,7 @@ export default function BuildingScheduler() {
                 {days.map((d,i)=>{const cr=crewDay[i],isO=cr>maxCrew,isT=sameDay(d,today),bH=cr>0?Math.max(1,(cr/chartCeil)*(CREW_H-14)):0;return <div key={i} onClick={()=>setCrewDayIdx(i)} style={{width:`${100/TOTAL_DAYS}%`,height:"100%",display:"flex",flexDirection:"column",justifyContent:"flex-end",alignItems:"center",borderRight:"1px solid #152A42",padding:"0 0 2px",cursor:"pointer"}}>{cr>0&&<div style={{width:"100%",height:bH,background:isO?"#EF4444":isT?"#0099D6":"#0099D640",transition:"height .15s"}}/>}</div>})}
               </div>
               {(()=>{const tIdx=days.findIndex(d=>sameDay(d,today));return tIdx>=0?<div style={{position:"absolute",left:`${((tIdx+.5)/TOTAL_DAYS)*100}%`,top:0,bottom:0,width:1.5,background:"#0099D670",zIndex:15,pointerEvents:"none"}}/>:null})()}
+              {(()=>{if(!projectedFinish)return null;const fIdx=days.findIndex(d=>sameDay(d,projectedFinish));return fIdx>=0?<div style={{position:"absolute",left:`${((fIdx+.5)/TOTAL_DAYS)*100}%`,top:0,bottom:0,width:2,background:`${finishColor}80`,zIndex:14,pointerEvents:"none"}}><div style={{position:"absolute",top:0,left:-20,width:42,textAlign:"center",background:`${finishColor}30`,borderRadius:"0 0 4px 4px",padding:"1px 4px"}}><span style={{fontSize:6,fontWeight:700,color:finishColor}}>FINISH</span></div></div>:null})()}
             </div>
           </div>
         </div>
